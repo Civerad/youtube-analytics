@@ -1,170 +1,483 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
+"""
+YouTube Analytics — per-video data extraction → BigQuery.
+Pulls analytics for every video on the channel and loads each report
+into a separate BigQuery table.
 
-###
-#
-# Retrieves YouTube Analytics report data. The script's default behavior
-# is to retrieve data for the authenticated user's channel. However, if you
-# set a value for the --content-owner command-line argument, then the script
-# retrieves data for that content owner. Note that the user running the script
-# must be authorized to retrieve data for that content owner.
-#
-# Note that when you retrieve Analytics data for a content owner, your API
-# request must set a value for the "filters" request parameter as explained
-# in the API documentation here:
-# https://developers.google.com/youtube/analytics/v1/content_owner_reports#Filters
-#
-# By default, if you set a value for the --content-owner argument, then the
-# "filters" parameter is set to "claimedStatus==claimed". (On the other hand,
-# this value is not set if you are retrieving data for your own channel.)
-#
-# You can use the --filters command-line argument to set the "filters" parameter
-# for any request. For example:
-#   * --filters="channel==CHANNEL_ID"
-#   * --filters="channel==CHANNEL_ID;country==COUNTRY_CODE"
-#   * --filters="video==VIDEO_ID"
-#   * --filters="claimedStatus==claimed;uploaderType==thirdParty"
-#   * etc.
-#
-###
+Prerequisites:
+  pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client google-cloud-bigquery pandas pyarrow
 
-import argparse
+Setup:
+  1. Go to https://console.cloud.google.com/
+  2. Enable "YouTube Analytics API", "YouTube Data API v3", and "BigQuery API"
+  3. Create OAuth 2.0 credentials (Desktop app) and download as client_secret.json
+  4. Place client_secret.json in the same folder as this script
+  5. Set GCP_PROJECT_ID and BQ_DATASET below
+  6. Run the script — a browser window will open on the first run
+  7. Credentials are cached in token.pickle for subsequent runs
+"""
+
 import os
+import pickle
 
-import google.oauth2.credentials
-import google_auth_oauthlib.flow
+import pandas as pd
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google_auth_oauthlib.flow import InstalledAppFlow
-from datetime import datetime, timedelta
+from google.cloud import bigquery
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+CLIENT_SECRETS_FILE = "client_secret.json"
+TOKEN_FILE = "token.pickle"
+
+SCOPES = [
+    "https://www.googleapis.com/auth/yt-analytics.readonly",
+    "https://www.googleapis.com/auth/youtube.readonly",
+]
+
+START_DATE     = "2025-01-01"
+END_DATE       = "2026-01-01"
+GCP_PROJECT_ID = "youtube-innconsciente"   
+BQ_DATASET     = "raw_youtube_analytics"      
+
+# ── Authentication ─────────────────────────────────────────────────────────────
+
+def get_credentials():
+    credentials = None
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, "rb") as f:
+            credentials = pickle.load(f)
+
+    if not credentials or not credentials.valid:
+        if credentials and credentials.expired and credentials.refresh_token:
+            credentials.refresh(Request())
+        else:
+            if not os.path.exists(CLIENT_SECRETS_FILE):
+                raise FileNotFoundError(
+                    f"'{CLIENT_SECRETS_FILE}' not found. "
+                    "Download it from Google Cloud Console (OAuth 2.0 → Desktop app)."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
+            credentials = flow.run_local_server(port=0)
+
+        with open(TOKEN_FILE, "wb") as f:
+            pickle.dump(credentials, f)
+
+    return credentials
 
 
-# The CLIENT_SECRETS_FILE variable specifies the name of a file that contains
-# the OAuth 2.0 information for this application, including its client_id and
-# client_secret. You can acquire an OAuth 2.0 client ID and client secret from
-# the {{ Google Cloud Console }} at
-# {{ https://cloud.google.com/console }}.
-# Please ensure that you have enabled the YouTube Analytics API for your project.
-# For more information about using OAuth2 to access the YouTube Analytics API, see:
-#   https://developers.google.com/youtube/reporting/guides/authorization
-# For more information about the client_secret.json file format, see:
-#   https://developers.google.com/api-client-library/python/guide/aaa_client_secrets
-CLIENT_SECRETS_FILE = 'client_secret.json'
+def build_services():
+    yt_credentials = get_credentials()
+    analytics  = build("youtubeAnalytics", "v2", credentials=yt_credentials)
+    reporting  = build("youtubereporting", "v1", credentials=yt_credentials)
+    youtube    = build("youtube", "v3", credentials=yt_credentials)
+    from google.oauth2 import service_account
+    sa_credentials = service_account.Credentials.from_service_account_file(
+        "youtube-innconsciente-5816fe914012.json",
+        scopes=["https://www.googleapis.com/auth/bigquery"],
+    )
+    bq_client = bigquery.Client(project=GCP_PROJECT_ID, credentials=sa_credentials)
+    return analytics, reporting, youtube, bq_client
 
-# These OAuth 2.0 access scopes allow for read-only access to the authenticated
-# user's account for both YouTube Data API resources and YouTube Analytics Data.
-SCOPES = ['https://www.googleapis.com/auth/yt-analytics.readonly']
-API_SERVICE_NAME = 'youtubeAnalytics'
-API_VERSION = 'v1'
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-# Authorize the request and store authorization credentials.
-def get_authenticated_service():
-  flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
-  credentials = flow.run_console()
+def get_channel_id(youtube):
+    channel_id = "UCIjLFrVmEmXhI38kTco2jyg"
+    print(f"Using manual channel: {channel_id}")
+    return channel_id
 
-  api_service = build(API_SERVICE_NAME, API_VERSION, credentials=credentials)
-  return api_service
 
-# Remove keyword arguments that are not set.
-def remove_empty_args(args):
-  original_args = vars(args)
-  good_args = {}
-  if original_args is not None:
-    for key, value in original_args.iteritems():
-      # The channel_id and content_owner arguments are provided as a means
-      # of properly setting the "ids" parameter value. However, they should
-      # not be included in the API request (since they're not parameters
-      # supported by this method).
-      if value and key != 'channel_id' and key != 'content_owner':
-        good_args[key] = value
-  return good_args
+def get_all_video_ids(youtube, channel_id):
+    """Fetch all video IDs from the channel using the uploads playlist."""
+    # Get uploads playlist ID
+    response = youtube.channels().list(
+        part="contentDetails",
+        id=channel_id
+    ).execute()
+    uploads_playlist = (
+        response["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    )
 
-# Set the "ids" request parameter for the YouTube Analytics API request.
-def set_ids_parameter(args):
-  if args.content_owner:
-    args.ids = 'contentOwner==' + args.content_owner
-    if args.filters == '':
-      args.filters = 'claimedStatus==claimed'
-  elif args.channel_id:
-    args.ids = 'channel==' + args.channel_id
-  else:
-    args.ids = 'channel==MINE'
-  args = remove_empty_args(args)
-  print args
-  return args
+    video_ids = []
+    next_page_token = None
 
-def run_analytics_report(youtube_analytics, args):
-  # Call the Analytics API to retrieve a report. Pass args in as keyword
-  # arguments to set values for the following parameters:
-  #
-  #   * ids
-  #   * metrics
-  #   * dimensions
-  #   * filters
-  #   * start_date
-  #   * end_date
-  #   * sort
-  #   * max_results
-  #
-  # For a list of available reports, see:
-  # https://developers.google.com/youtube/analytics/v1/channel_reports
-  # https://developers.google.com/youtube/analytics/v1/content_owner_reports
-  analytics_query_response = youtube_analytics.reports().query(
-    **args
-  ).execute()
+    while True:
+        pl_response = youtube.playlistItems().list(
+            part="contentDetails",
+            playlistId=uploads_playlist,
+            maxResults=50,
+            pageToken=next_page_token,
+        ).execute()
 
-  #print 'Analytics Data for Channel %s' % channel_id
+        for item in pl_response.get("items", []):
+            video_ids.append(item["contentDetails"]["videoId"])
 
-  for column_header in analytics_query_response.get('columnHeaders', []):
-    print '%-20s' % column_header['name'],
-  print
+        next_page_token = pl_response.get("nextPageToken")
+        if not next_page_token:
+            break
 
-  for row in analytics_query_response.get('rows', []):
-    for value in row:
-      print '%-20s' % value,
-    print
+    print(f"Found {len(video_ids)} videos on the channel.")
+    return video_ids
 
-if __name__ == '__main__':
-  now = datetime.now()
-  one_day_ago = (now - timedelta(days=1)).strftime('%Y-%m-%d')
-  one_week_ago = (now - timedelta(days=7)).strftime('%Y-%m-%d')
 
-  parser = argparse.ArgumentParser()
+def get_video_metadata(youtube, video_ids):
+    """Fetch title, publish date, duration, and description for each video."""
+    rows = []
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i : i + 50]
+        response = youtube.videos().list(
+            part="snippet,contentDetails,statistics",
+            id=",".join(batch),
+        ).execute()
+        for item in response.get("items", []):
+            snippet = item["snippet"]
+            stats   = item.get("statistics", {})
+            rows.append({
+                "video_id":        item["id"],
+                "title":           snippet["title"],
+                "published_at":    snippet["publishedAt"],
+                "duration":        item["contentDetails"]["duration"],
+                "yt_views":        stats.get("viewCount"),
+                "yt_likes":        stats.get("likeCount"),
+                "yt_comments":     stats.get("commentCount"),
+            })
+    return pd.DataFrame(rows)
 
-  # Set channel ID or content owner. Default is authenticated user's channel.
-  parser.add_argument('--channel-id', default='',
-      help='YouTube channel ID for which data should be retrieved. ' +
-           'Note that the default behavior is to retrieve data for ' +
-           'the authenticated user\'s channel.')
-  parser.add_argument('--content-owner', default='',
-      help='The name of the content owner for which data should be ' +
-           'retrieved. If you retrieve data for a content owner, then ' +
-           'your API request must also set a value for the "filters" ' +
-           'parameter. See the help for that parameter for more details.')
 
-  # Metrics, dimensions, filters
-  parser.add_argument('--metrics', help='Report metrics',
-    default='views,estimatedMinutesWatched,averageViewDuration')
-  parser.add_argument('--dimensions', help='Report dimensions', default='')
-  parser.add_argument('--filters', default='',
-      help='Filters for the report. Note that the filters request parameter ' +
-           'must be set in YouTube Analytics API requests for content owner ' +
-           'reports. The script sets "filters=claimedStatus==claimed" if a ' +
-           'content owner is specified and filters are not specified.')
+def _to_dataframe(api_response):
+    headers = [col["name"] for col in api_response.get("columnHeaders", [])]
+    rows    = api_response.get("rows", [])
+    if not rows:
+        return pd.DataFrame(columns=headers)
+    return pd.DataFrame(rows, columns=headers)
 
-  # Report dates. Defaults to start 7 days ago, end yesterday.
-  parser.add_argument('--start-date', default=one_week_ago,
-    help='Start date, in YYYY-MM-DD format')
-  parser.add_argument('--end-date', default=one_day_ago,
-    help='End date, in YYYY-MM-DD format')
+# ── Per-video analytics queries ───────────────────────────────────────────────
 
-  parser.add_argument('--max-results', help='Max results')
-  parser.add_argument('--sort', help='Sort order', default='')
+def query_video_totals(analytics, channel_id, video_ids, start_date, end_date):
+    """
+    Aggregate metrics for every video over the full date range.
+    One row per video.
+    """
+    # Analytics API accepts up to ~200 video IDs in the filter at once;
+    # we batch them to be safe.
+    all_rows = []
+    batch_size = 100
 
-  args = parser.parse_args()
-  args = set_ids_parameter(args)
+    for i in range(0, len(video_ids), batch_size):
+        batch = video_ids[i : i + batch_size]
+        video_filter = "video==" + ",".join(batch)
 
-  youtube_analytics = get_authenticated_service()
-  try:
-    run_analytics_report(youtube_analytics, args)
-  except HttpError, e:
-    print 'An HTTP error %d occurred:\n%s' % (e.resp.status, e.content)
+        response = analytics.reports().query(
+            ids="channel==UCIjLFrVmEmXhI38kTco2jyg",
+            startDate=start_date,
+            endDate=end_date,
+            metrics=(
+                "views,"
+                "estimatedMinutesWatched,"
+                "averageViewDuration,"
+                "averageViewPercentage,"
+                "subscribersGained,"
+                "subscribersLost,"
+                "likes,"
+                "comments,"
+                "shares,"
+                "cardClickRate,"
+                "cardTeaserClickRate,"
+                "annotationClickThroughRate,"
+                "annotationCloseRate"
+            ),
+            dimensions="video",
+            filters=video_filter,
+            sort="-views",
+        ).execute()
+
+        df = _to_dataframe(response)
+        if not df.empty:
+            all_rows.append(df)
+
+    return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+
+
+def query_video_daily(analytics, channel_id, video_ids, start_date, end_date):
+    """
+    Daily breakdown per video — useful for time-series analysis.
+    """
+    all_rows = []
+    batch_size = 50  # smaller batches for daily granularity
+
+    for i in range(0, len(video_ids), batch_size):
+        batch = video_ids[i : i + batch_size]
+        video_filter = "video==" + ",".join(batch)
+
+        response = analytics.reports().query(
+            ids="channel==UCIjLFrVmEmXhI38kTco2jyg",
+            startDate=start_date,
+            endDate=end_date,
+            metrics=(
+                "views,"
+                "estimatedMinutesWatched,"
+                "subscribersGained,"
+                "likes,"
+                "comments,"
+                "shares"
+            ),
+            dimensions="day,video",
+            filters=video_filter,
+            sort="day,video",
+        ).execute()
+
+        df = _to_dataframe(response)
+        if not df.empty:
+            all_rows.append(df)
+
+    return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+
+
+def query_video_traffic_sources(analytics, channel_id, video_ids, start_date, end_date):
+    """Traffic source breakdown per video."""
+    all_rows = []
+    batch_size = 50
+
+    for i in range(0, len(video_ids), batch_size):
+        batch = video_ids[i : i + batch_size]
+        video_filter = "video==" + ",".join(batch)
+
+        response = analytics.reports().query(
+            ids="channel==UCIjLFrVmEmXhI38kTco2jyg",
+            startDate=start_date,
+            endDate=end_date,
+            metrics="views,estimatedMinutesWatched",
+            dimensions="video,insightTrafficSourceType",
+            filters=video_filter,
+            sort="video,-views",
+        ).execute()
+
+        df = _to_dataframe(response)
+        if not df.empty:
+            all_rows.append(df)
+
+    return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+
+
+def query_video_geography(analytics, channel_id, video_ids, start_date, end_date):
+    """Country breakdown per video."""
+    all_rows = []
+    batch_size = 50
+
+    for i in range(0, len(video_ids), batch_size):
+        batch = video_ids[i : i + batch_size]
+        video_filter = "video==" + ",".join(batch)
+
+        response = analytics.reports().query(
+            ids="channel==UCIjLFrVmEmXhI38kTco2jyg",
+            startDate=start_date,
+            endDate=end_date,
+            metrics="views,estimatedMinutesWatched,subscribersGained",
+            dimensions="video,country",
+            filters=video_filter,
+            sort="video,-views",
+        ).execute()
+
+        df = _to_dataframe(response)
+        if not df.empty:
+            all_rows.append(df)
+
+    return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+
+
+def query_video_age_gender(analytics, channel_id, video_ids, start_date, end_date):
+    """Age/gender breakdown per video."""
+    all_rows = []
+
+    # Age/gender only supports one video at a time via the filter
+    for video_id in video_ids:
+        try:
+            response = analytics.reports().query(
+                ids="channel==UCIjLFrVmEmXhI38kTco2jyg",
+                startDate=start_date,
+                endDate=end_date,
+                metrics="viewerPercentage",
+                dimensions="ageGroup,gender",
+                filters=f"video=={video_id}",
+                sort="gender,ageGroup",
+            ).execute()
+            df = _to_dataframe(response)
+            if not df.empty:
+                df.insert(0, "video", video_id)
+                all_rows.append(df)
+        except HttpError:
+            # Some videos may have no demographic data
+            pass
+
+    return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+
+
+def query_video_device_type(analytics, channel_id, video_ids, start_date, end_date):
+    """Device type breakdown per video."""
+    all_rows = []
+    batch_size = 50
+
+    for i in range(0, len(video_ids), batch_size):
+        batch = video_ids[i : i + batch_size]
+        video_filter = "video==" + ",".join(batch)
+
+        response = analytics.reports().query(
+            ids="channel==UCIjLFrVmEmXhI38kTco2jyg",
+            startDate=start_date,
+            endDate=end_date,
+            metrics="views,estimatedMinutesWatched",
+            dimensions="video,deviceType",
+            filters=video_filter,
+            sort="video,-views",
+        ).execute()
+
+        df = _to_dataframe(response)
+        if not df.empty:
+            all_rows.append(df)
+
+    return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+
+# ── Enrich with titles ────────────────────────────────────────────────────────
+
+def add_titles(df, metadata_df):
+    """Add video title column after the video ID column."""
+    if "video" not in df.columns or df.empty:
+        return df
+    id_to_title = metadata_df.set_index("video_id")["title"].to_dict()
+    df = df.copy()
+    df.insert(1, "title", df["video"].map(id_to_title))
+    return df
+
+# ── BigQuery upload ───────────────────────────────────────────────────────────
+
+def upload_to_bigquery(bq_client, df, table_name):
+    """Upload a DataFrame to BigQuery, replacing the table each run."""
+    if df.empty:
+        print(f"  {table_name}: skipped (no data)")
+        return
+
+    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{table_name}"
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        autodetect=True,
+    )
+    job = bq_client.load_table_from_dataframe(df, table_id, job_config=job_config)
+    job.result()  # wait for completion
+    print(f"  {table_name}: {len(df)} rows → {table_id}")
+
+
+def ensure_dataset(bq_client):
+    """Create the BigQuery dataset if it doesn't exist."""
+    dataset_ref = bigquery.Dataset(f"{GCP_PROJECT_ID}.{BQ_DATASET}")
+    dataset_ref.location = "US"
+    bq_client.create_dataset(dataset_ref, exists_ok=True)
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+REPORT_TYPES = [
+    "channel_basic_a3",
+    "channel_combined_a3",
+    "channel_demographics_a1",
+    "channel_device_os_a3",
+    "channel_traffic_source_a3",
+    "channel_reach_basic_a1",
+]
+
+
+def ensure_jobs(reporting):
+    """Create reporting jobs for each report type if they don't exist yet."""
+    existing = {
+        j["reportTypeId"]: j["id"]
+        for j in reporting.jobs().list().execute().get("jobs", [])
+    }
+    job_ids = {}
+    for report_type in REPORT_TYPES:
+        if report_type in existing:
+            job_ids[report_type] = existing[report_type]
+            print(f"  Job exists: {report_type} ({existing[report_type]})")
+        else:
+            job = reporting.jobs().create(body={"reportTypeId": report_type}).execute()
+            job_ids[report_type] = job["id"]
+            print(f"  Job created: {report_type} ({job['id']})")
+    return job_ids
+
+
+def download_reports(reporting, job_ids, start_date, end_date):
+    """Download all available reports for each job within the date range and return DataFrames."""
+    import io
+    import csv
+    from datetime import datetime
+
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt   = datetime.strptime(end_date,   "%Y-%m-%d")
+
+    results = {}
+    for report_type, job_id in job_ids.items():
+        all_rows = []
+        headers  = None
+        reports  = reporting.jobs().reports().list(jobId=job_id).execute()
+
+        for report in reports.get("reports", []):
+            create_time = report.get("startTime", "")
+            if create_time:
+                report_dt = datetime.strptime(create_time[:10], "%Y-%m-%d")
+                if not (start_dt <= report_dt <= end_dt):
+                    continue
+
+            # Download the report CSV
+            url  = report["downloadUrl"]
+            name = url.split("v1/")[-1]
+            req  = reporting.media().download(resourceName=name)
+            buf  = io.BytesIO()
+            from googleapiclient.http import MediaIoBaseDownload
+            downloader = MediaIoBaseDownload(buf, req)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+
+            buf.seek(0)
+            reader = csv.reader(io.TextIOWrapper(buf, encoding="utf-8"))
+            file_headers = next(reader, None)
+            if headers is None and file_headers:
+                headers = file_headers
+            for row in reader:
+                all_rows.append(row)
+
+        if all_rows and headers:
+            results[report_type] = pd.DataFrame(all_rows, columns=headers)
+            print(f"  {report_type}: {len(all_rows)} rows")
+        else:
+            print(f"  {report_type}: no data in range (reports may take 24-48h to generate)")
+            results[report_type] = pd.DataFrame()
+
+    return results
+
+
+def main():
+    print(f"YouTube Reporting API → BigQuery | {START_DATE} → {END_DATE}\n")
+
+    analytics, reporting, youtube, bq_client = build_services()
+
+    print("Ensuring reporting jobs exist...")
+    job_ids = ensure_jobs(reporting)
+
+    print("\nDownloading reports...")
+    reports = download_reports(reporting, job_ids, START_DATE, END_DATE)
+
+    print("\nUploading to BigQuery...")
+    ensure_dataset(bq_client)
+    for table_name, df in reports.items():
+        upload_to_bigquery(bq_client, df, table_name)
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except HttpError as e:
+        print(f"HTTP error {e.resp.status}:\n{e.content.decode()}")
+    except KeyboardInterrupt:
+        print("Cancelled.")

@@ -1,0 +1,6 @@
+client_secret*.json
+service_account*.json
+*.pickle
+token.json
+*.json
+!README*.json
